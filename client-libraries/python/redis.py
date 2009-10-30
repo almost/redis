@@ -6,6 +6,8 @@ History:
 
         - 20090603 fix missing errno import, add sunion and sunionstore commands,
           generalize shebang (Jochen Kupperschmidt)
+        - 20091030 sanitize input keys and numeric values, reject invalid ones.
+          also changed the doctests involving Decimals to make them pass (Thomas Parslow)
 
 """
 
@@ -23,6 +25,7 @@ __date__ = "$LastChangedDate: 2009-03-17 16:15:55 +0100 (Mar, 17 Mar 2009) $"[18
 import socket
 import decimal
 import errno
+import re
 
 
 BUFSIZE = 4096
@@ -33,6 +36,8 @@ class ConnectionError(RedisError): pass
 class ResponseError(RedisError): pass
 class InvalidResponse(RedisError): pass
 class InvalidData(RedisError): pass
+
+BAD_NAME_RE = re.compile("[ \n\r]")
 
 
 class Redis(object):
@@ -60,6 +65,12 @@ class Redis(object):
             except UnicodeEncodeError, e:
                 raise InvalidData("Error encoding unicode value '%s': %s" % (value.encode(self.charset, 'replace'), e))
         return str(s)
+
+    def _sanitize_key(self, name):
+        name = self._encode(name)
+        if BAD_NAME_RE.findall(name):
+            raise InvalidData("Key supplied contains whitespace: %r" % (name,))
+        return name
     
     def _write(self, s):
         """
@@ -119,8 +130,12 @@ class Redis(object):
         'OK'
         >>> r.set('b', 'xxx', preserve=True)
         0
-        >>> r.get('b')
-        Decimal("105.2")
+        >>> repr(r.get('b'))
+        "Decimal('105.2')"
+        >>> r.set("boguskey test\\r\\nDEL b\\r\\n","ignore")
+        Traceback (most recent call last):
+          File "<stdin>", line 1, in ?
+        InvalidData: Key supplied contains whitespace: 'boguskey test\\r\\nDEL b\\r\\n'
         >>> 
         """
         self.connect()
@@ -131,6 +146,7 @@ class Redis(object):
         elif preserve: command = 'SETNX'
         else: command = 'SET'
         value = self._encode(value)
+        name = self._sanitize_key(name)
         self._write('%s %s %s\r\n%s\r\n' % (
                 command, name, len(value), value
             ))
@@ -154,9 +170,14 @@ class Redis(object):
         >>> r.get('c')
         u' \\r\\naaa\\nbbb\\r\\ncccc\\nddd\\r\\n '
         >>> r.get('ajhsd')
+        >>> r.get("ajhsd\\r\\nDEL b\\r\\n")
+        Traceback (most recent call last):
+          File "<stdin>", line 1, in ?
+        InvalidData: Key supplied contains whitespace: 'ajhsd\\r\\nDEL b\\r\\n'
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         self._write('GET %s\r\n' % name)
         return self.get_response()
     
@@ -181,6 +202,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        arsg = map(self._sanitize_key,args)
         self._write('MGET %s\r\n' % ' '.join(args))
         return self.get_response()
     
@@ -198,6 +220,7 @@ class Redis(object):
         >>>
         """
         self.connect()
+        name = self._sanitize_key(name)
         if amount == 1:
             self._write('INCR %s\r\n' % name)
         else:
@@ -221,6 +244,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         if amount == 1:
             self._write('DECR %s\r\n' % name)
         else:
@@ -239,6 +263,7 @@ class Redis(object):
         >>>
         """
         self.connect()
+        name = self._sanitize_key(name)
         self._write('EXISTS %s\r\n' % name)
         return self.get_response()
 
@@ -258,6 +283,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         self._write('DEL %s\r\n' % name)
         return self.get_response()
 
@@ -272,6 +298,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         self._write('TYPE %s\r\n' % name)
         res = self.get_response()
         return None if res == 'none' else res
@@ -287,7 +314,7 @@ class Redis(object):
         [u'a']
         >>> r.set('a2', 'a')
         'OK'
-        >>> r.keys('a*')
+        >>> sorted(r.keys('a*'))
         [u'a', u'a2']
         >>> r.delete('a2')
         1
@@ -296,6 +323,7 @@ class Redis(object):
         >>>
         """
         self.connect()
+        pattern = self._sanitize_key(pattern)
         self._write('KEYS %s\r\n' % pattern)
         return self.get_response().split()
     
@@ -335,6 +363,8 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        src = self._sanitize_key(src)
+        dst = self._sanitize_key(dst)
         if preserve:
             self._write('RENAMENX %s %s\r\n' % (src, dst))
             return self.get_response()
@@ -367,6 +397,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         self._write('TTL %s\r\n' % name)
         return self.get_response()
     
@@ -379,10 +410,15 @@ class Redis(object):
         1
         >>> r.expire('zzzzz', 1)
         0
+        >>> r.expire('z',"1\\r\\nDEL something\\r\\n")
+        Traceback (most recent call last):
+          File "<stdin>", line 1, in ?
+        TypeError: %d format: a number is required, not str
         >>> 
         """
         self.connect()
-        self._write('EXPIRE %s %s\r\n' % (name, time))
+        name = self._sanitize_key(name)
+        self._write('EXPIRE %s %d\r\n' % (name, time))
         return self.get_response()
     
     def push(self, name, value, tail=False):
@@ -403,6 +439,7 @@ class Redis(object):
         """
         self.connect()
         value = self._encode(value)
+        name = self._sanitize_key(name)
         self._write('%s %s %s\r\n%s\r\n' % (
             'LPUSH' if tail else 'RPUSH', name, len(value), value
         ))
@@ -424,6 +461,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         self._write('LLEN %s\r\n' % name)
         return self.get_response()
 
@@ -448,10 +486,15 @@ class Redis(object):
         []
         >>> r.lrange('l', -1, -1)
         [u'bbb']
-        >>> 
+        >>> r.lrange('z',"0", "1\\r\\nDEL something\\r\\n")
+        Traceback (most recent call last):
+          File "<stdin>", line 1, in ?
+        TypeError: %d format: a number is required, not str
+        >>>         
         """
         self.connect()
-        self._write('LRANGE %s %s %s\r\n' % (name, start, end))
+        name = self._sanitize_key(name)
+        self._write('LRANGE %s %d %d\r\n' % (name, start, end))
         return self.get_response()
         
     def ltrim(self, name, start, end):
@@ -478,10 +521,15 @@ class Redis(object):
         'OK'
         >>> r.llen('l')
         0
-        >>> 
+        >>> r.ltrim('l',"0", "1\\r\\nDEL something\\r\\n")
+        Traceback (most recent call last):
+          File "<stdin>", line 1, in ?
+        TypeError: %d format: a number is required, not str
+        >>>
         """
         self.connect()
-        self._write('LTRIM %s %s %s\r\n' % (name, start, end))
+        name = self._sanitize_key(name)
+        self._write('LTRIM %s %d %d\r\n' % (name, start, end))
         return self.get_response()
     
     def lindex(self, name, index):
@@ -503,7 +551,8 @@ class Redis(object):
         >>> 
         """
         self.connect()
-        self._write('LINDEX %s %s\r\n' % (name, index))
+        name = self._sanitize_key(name)
+        self._write('LINDEX %s %d\r\n' % (name, index))
         return self.get_response()
         
     def pop(self, name, tail=False):
@@ -533,6 +582,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         self._write('%s %s\r\n' % ('RPOP' if tail else 'LPOP', name))
         return self.get_response()
     
@@ -560,8 +610,9 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         value = self._encode(value)
-        self._write('LSET %s %s %s\r\n%s\r\n' % (
+        self._write('LSET %s %d %s\r\n%s\r\n' % (
             name, index, len(value), value
         ))
         return self.get_response()
@@ -594,8 +645,9 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         value = self._encode(value)
-        self._write('LREM %s %s %s\r\n%s\r\n' % (
+        self._write('LREM %s %d %s\r\n%s\r\n' % (
             name, num, len(value), value
         ))
         return self.get_response()
@@ -619,37 +671,41 @@ class Redis(object):
         1
         >>> for i in range(1, 5):
         ...     res = r.push('l', 1.0 / i)
-        >>> r.sort('l')
-        [Decimal("0.25"), Decimal("0.333333333333"), Decimal("0.5"), Decimal("1.0")]
-        >>> r.sort('l', desc=True)
-        [Decimal("1.0"), Decimal("0.5"), Decimal("0.333333333333"), Decimal("0.25")]
-        >>> r.sort('l', desc=True, start=2, num=1)
-        [Decimal("0.333333333333")]
+        >>> repr(r.sort('l'))
+        "[Decimal('0.25'), Decimal('0.333333333333'), Decimal('0.5'), Decimal('1.0')]"
+        >>> repr(r.sort('l', desc=True))
+        "[Decimal('1.0'), Decimal('0.5'), Decimal('0.333333333333'), Decimal('0.25')]"
+        >>> repr(r.sort('l', desc=True, start=2, num=1))
+        "[Decimal('0.333333333333')]"
         >>> r.set('weight_0.5', 10)
         'OK'
-        >>> r.sort('l', desc=True, by='weight_*')
-        [Decimal("0.5"), Decimal("1.0"), Decimal("0.333333333333"), Decimal("0.25")]
+        >>> repr(r.sort('l', desc=True, by='weight_*'))
+        "[Decimal('0.5'), Decimal('1.0'), Decimal('0.333333333333'), Decimal('0.25')]"
         >>> for i in r.sort('l', desc=True):
         ...     res = r.set('test_%s' % i, 100 - float(i))
-        >>> r.sort('l', desc=True, get='test_*')
-        [Decimal("99.0"), Decimal("99.5"), Decimal("99.6666666667"), Decimal("99.75")]
-        >>> r.sort('l', desc=True, by='weight_*', get='test_*')
-        [Decimal("99.5"), Decimal("99.0"), Decimal("99.6666666667"), Decimal("99.75")]
+        >>> repr(r.sort('l', desc=True, get='test_*'))
+        "[Decimal('99.0'), Decimal('99.5'), Decimal('99.6666666667'), Decimal('99.75')]"
+        >>> repr(r.sort('l', desc=True, by='weight_*', get='test_*'))
+        "[Decimal('99.5'), Decimal('99.0'), Decimal('99.6666666667'), Decimal('99.75')]"
         >>> r.sort('l', desc=True, by='weight_*', get='missing_*')
         [None, None, None, None]
         >>> 
         """
+        name = self._sanitize_key(name)
         stmt = ['SORT', name]
         if by:
+            by = self._sanitize_key(by)
             stmt.append("BY %s" % by)
         if start and num:
-            stmt.append("LIMIT %s %s" % (start, num))
+            stmt.append("LIMIT %d %d" % (start, num))
         if get is None:
             pass
         elif isinstance(get, basestring):
+            get = self._sanitize_key(get)
             stmt.append("GET %s" % get)
         elif isinstance(get, list) or isinstance(get, tuple):
             for g in get:
+                g = self._sanitize_key(g)
                 stmt.append("GET %s" % g)
         else:
             raise RedisError("Invalid parameter 'get' for Redis sort")
@@ -672,6 +728,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         value = self._encode(value)
         self._write('SADD %s %s\r\n%s\r\n' % (
             name, len(value), value
@@ -695,6 +752,7 @@ class Redis(object):
         """
         self.connect()
         value = self._encode(value)
+        name = self._sanitize_key(name)
         self._write('SREM %s %s\r\n%s\r\n' % (
             name, len(value), value
         ))
@@ -717,6 +775,7 @@ class Redis(object):
         """
         self.connect()
         value = self._encode(value)
+        name = self._sanitize_key(name)
         self._write('SISMEMBER %s %s\r\n%s\r\n' % (
             name, len(value), value
         ))
@@ -751,6 +810,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        args = map(self._sanitize_key,args)
         self._write('SINTER %s\r\n' % ' '.join(args))
         return set(self.get_response())
     
@@ -775,6 +835,8 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        dest = self._sanitize_key(dest)
+        args = map(self._sanitize_key,args)
         self._write('SINTERSTORE %s %s\r\n' % (dest, ' '.join(args)))
         return self.get_response()
 
@@ -797,6 +859,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        name = self._sanitize_key(name)
         self._write('SMEMBERS %s\r\n' % name)
         return set(self.get_response())
 
@@ -821,6 +884,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        args = map(self._sanitize_key,args)
         self._write('SUNION %s\r\n' % ' '.join(args))
         return set(self.get_response())
 
@@ -843,6 +907,8 @@ class Redis(object):
         >>> 
         """
         self.connect()
+        args = map(self._sanitize_key,args)
+        dest = self._sanitize_key(dest)
         self._write('SUNIONSTORE %s %s\r\n' % (dest, ' '.join(args)))
         return self.get_response()
 
@@ -861,7 +927,7 @@ class Redis(object):
         >>> 
         """
         self.connect()
-        self._write('SELECT %s\r\n' % db)
+        self._write('SELECT %d\r\n' % db)
         return self.get_response()
     
     def move(self, name, db):
@@ -890,7 +956,8 @@ class Redis(object):
         >>> 
         """
         self.connect()
-        self._write('MOVE %s %s\r\n' % (name, db))
+        name = self._sanitize_key(name)
+        self._write('MOVE %s %d\r\n' % (name, db))
         return self.get_response()
     
     def save(self, background=False):
@@ -962,6 +1029,7 @@ class Redis(object):
     
     def auth(self, passwd):
         self.connect()
+        passwd = self._sanitize_key(passwd)
         self._write('AUTH %s\r\n' % passwd)
         return self.get_response()
     
